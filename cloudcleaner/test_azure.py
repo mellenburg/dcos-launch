@@ -2,6 +2,7 @@
 import copy
 import json
 import os
+from collections import namedtuple
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -18,10 +19,53 @@ pytestmark = [pytest.mark.usefixtures('mocked_aws')]
 
 now = datetime(2016, 1, 8, 1, 20, 30, 14, timezone.utc)
 
+MockAzureWrapper = namedtuple('MockAzureWrapper', 'rmc mc')
+
 
 @pytest.fixture
 def mocked_aws(monkeypatch):
     monkeypatch.setattr(cloudcleaner.aws, 'AwsCleaner', cloudcleaner.common.MockCleaner)
+
+
+@pytest.fixture
+def mocked_rmc(monkeypatch):
+    monkeypatch.setattr(cloudcleaner.azure, 'delete_resource_group', mock_delete_resource_group)
+
+    anonymous = _MockResourceGroup({}, name='anonymous')  # should be deleted in 2h
+    invalid_user = _MockResourceGroup({'owner': 'foo'}, name='invalid_user')  # should be deleted in 2h
+    valid_user = _MockResourceGroup({'owner': 'test_user'}, name='valid_user')  # should be deleted in 2h
+    # gone in 2h
+    invalid_expiration = _MockResourceGroup({
+        'expiration': 'next week',
+        'owner': 'test_user',
+        'creation_time': dump_time(now)}, name='invalid_expiration')
+    # will be deleted 12h in
+    ok_group = _MockResourceGroup({
+        'owner': 'test_user',
+        'creation_time': dump_time(now - timedelta(hours=36)),
+        'expiration': '2days'}, name='ok_group')
+    # will be deleted 1h in
+    ci_group = _MockResourceGroup({
+        'owner': cloudcleaner.common.CI_OWNER,
+        'creation_time': dump_time(now - timedelta(hours=3)),
+        'expiration': '4h'}, name='ci_group')
+    # will never expire
+    never_expire = _MockResourceGroup({'expiration': 'never'}, name='never_expire')
+
+    resource_group_pool = [anonymous, invalid_user, valid_user, ok_group, ci_group, invalid_expiration, never_expire]
+
+    monkeypatch.setattr(cloudcleaner.azure, 'azure_wrapper',
+                        MockAzureWrapper(MockRmc(group_list=resource_group_pool), MockMc()))
+
+
+def mock_delete_resource_group(mock_rmc, resource_group_name):
+    if mock_rmc.group_list is None:
+        return
+    for i in range(len(mock_rmc.group_list)):
+        if mock_rmc.group_list[i].name == resource_group_name:
+            del mock_rmc.group_list[i]
+            return
+    raise Exception('Group {} cannot be deleted because it cannot be found'.format(resource_group_name))
 
 
 class _MockResourceGroup:
@@ -34,6 +78,32 @@ class _MockResourceGroup:
     @property
     def properties(self):
         return self
+
+
+class MockRmc:
+    def __init__(self, group_list=None):
+        self.group_list = group_list if group_list is not None else None
+        """ rmc is only called to access resource_groups so just map it back
+        to this object to avoid creating an extra useless object
+        """
+        self.resource_groups = self
+
+    def patch(self, name: str, tags: dict, raw=True):
+        pass
+
+    def list(self):
+        return self.group_list
+
+
+class MockMc:
+    ActivityLogs = namedtuple('ActivityLogs', 'list')
+
+    @staticmethod
+    def list(filter=None, select=None):
+        return []
+
+    def __init__(self):
+        self.activity_logs = self.ActivityLogs(self.list)
 
 
 def dump_time(dt):
@@ -95,40 +165,6 @@ def test_categorize():
         'creation_time': dump_time(expired_dt)})
 
 
-class MockRmc:
-    def __init__(self, group_list=None):
-        self.group_list = group_list if group_list is not None else None
-
-    @property
-    def resource_groups(self):
-        """ rmc is only called to access resource_groups so just map it back
-        to this object to avoid creating an extra useless object
-        """
-        return self
-
-    def patch(self, name: str, tags: dict, raw=True):
-        pass
-
-    def list(self):
-        return self.group_list
-
-
-def mock_delete_resource_group(mock_rmc, resource_group_name):
-    if mock_rmc.group_list is None:
-        return
-    for i in range(len(mock_rmc.group_list)):
-        if mock_rmc.group_list[i].name == resource_group_name:
-            del mock_rmc.group_list[i]
-            return
-    raise Exception('Group {} cannot be deleted because it cannot be found'.format(resource_group_name))
-
-
-@pytest.fixture
-def mocked_rmc(monkeypatch):
-    monkeypatch.setattr(cloudcleaner.azure, 'get_resource_mgmt_client', lambda: MockRmc())
-    monkeypatch.setattr(cloudcleaner.azure, 'delete_resource_group', mock_delete_resource_group)
-
-
 def test_take_resource_group_action(monkeypatch, mocked_rmc):
     """Test taking actions given a category + instance. Both dry run and not."""
     monkeypatch.setattr(
@@ -138,7 +174,7 @@ def test_take_resource_group_action(monkeypatch, mocked_rmc):
     def check(category,
               action,
               tags,
-              expected_tags=dict()):
+              expected_tags):
 
         resource_group = _MockResourceGroup(tags)
         assert cloudcleaner.azure.take_resource_group_action(
@@ -156,7 +192,7 @@ def test_take_resource_group_action(monkeypatch, mocked_rmc):
     check('invalid_owner', 'owned_by_cloudcleaner',
           {'owner': 'foobar'}, expected_tags={'owner': cloudcleaner.common.CI_OWNER,
                                               'error_message': 'invalid owner was set'})
-    check('error', 'noop', {})
+    check('error', 'noop', {}, {})
 
     check('needs_expiration', 'add_expiration', {}, expected_tags={'expiration': '2h'})
     check('invalid_expiration', 'add_expiration', {'expiration': 'foobar'}, expected_tags={'expiration': '2h'})
@@ -169,7 +205,7 @@ def test_take_resource_group_action(monkeypatch, mocked_rmc):
     check('invalid_creation_time', 'add_creation_time', {'creation_time': 'foobar'},
           expected_tags={'creation_time': dump_time(now - timedelta(days=30))})
 
-    check('expired', 'deleted', {'owner': 'test_user', 'creation_time': dump_time(now)})
+    check('expired', 'deleted', {'owner': 'test_user', 'creation_time': dump_time(now)}, {})
 
 
 def test_advance_states(tmpdir, monkeypatch, mocked_rmc):
@@ -183,29 +219,6 @@ def test_advance_states(tmpdir, monkeypatch, mocked_rmc):
 def do_test_advance_states(monkeypatch):
     """make a number of resource groups with different tags and step through them
     """
-    anonymous = _MockResourceGroup({}, name='anonymous')  # should be deleted in 2h
-    invalid_user = _MockResourceGroup({'owner': 'foo'}, name='invalid_user')  # should be deleted in 2h
-    valid_user = _MockResourceGroup({'owner': 'test_user'}, name='valid_user')  # should be deleted in 2h
-    # gone in 2h
-    invalid_expiration = _MockResourceGroup({
-        'expiration': 'next week',
-        'owner': 'test_user',
-        'creation_time': dump_time(now)}, name='invalid_expiration')
-    # will be deleted 12h in
-    ok_group = _MockResourceGroup({
-        'owner': 'test_user',
-        'creation_time': dump_time(now - timedelta(hours=36)),
-        'expiration': '2days'}, name='ok_group')
-    # will be deleted 1h in
-    ci_group = _MockResourceGroup({
-        'owner': cloudcleaner.common.CI_OWNER,
-        'creation_time': dump_time(now - timedelta(hours=3)),
-        'expiration': '4h'}, name='ci_group')
-    # will never expire
-    never_expire = _MockResourceGroup({'expiration': 'never'}, name='never_expire')
-
-    resource_group_pool = [anonymous, invalid_user, valid_user, ok_group, ci_group, invalid_expiration, never_expire]
-
     expected_states = [
         (
             timedelta(minutes=0),
@@ -300,11 +313,9 @@ def do_test_advance_states(monkeypatch):
     step_duration = cloudcleaner.common.EXPIRE_WARNING_TIME
     # step_duration = timedelta(minutes=30)
 
-    mock_rmc = MockRmc(group_list=resource_group_pool)
     # Make it so do_main is running in the sandbox we've prepared, clock and all.
     monkeypatch.setattr('cloudcleaner.get_users', lambda: ['test_user'])
     monkeypatch.setattr('cloudcleaner.get_time', lambda: clock)
-    monkeypatch.setattr(cloudcleaner.azure, 'get_resource_mgmt_client', lambda: mock_rmc)
     monkeypatch.setattr(cloudcleaner.azure, 'resource_group_to_json', lambda rg, now: rg.name)
 
     # Make sure the build directory is clean so we only get output from the
@@ -349,7 +360,7 @@ def do_test_advance_states(monkeypatch):
             break
 
 
-def test_resource_group_to_json(mocked_rmc):
+def test_resource_group_to_json():
     assert resource_group_to_json(
         _MockResourceGroup({}, name='foobar'), now) == {
             'name': 'foobar',
